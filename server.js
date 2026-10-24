@@ -1,7 +1,5 @@
-// server.js (Your dedicated Render backend)
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
-// Import your preferred AI SDK (e.g., OpenAI, Google Generative AI)
 
 const app = express();
 app.use(express.json());
@@ -10,10 +8,17 @@ app.use(express.json());
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
 app.post('/generate-reply', async (req, res) => {
-  const { sessionId, traineeMessage } = req.body;
+  // Capture the session ID regardless of whether the frontend uses an underscore or camelCase
+  const activeSessionId = req.body.sessionId || req.body.session_id;
+
+  // Safety check to prevent database crashes
+  if (!activeSessionId) {
+    console.error("Missing session ID! Received payload:", req.body);
+    return res.status(400).json({ error: 'Missing session ID in request' });
+  }
 
   try {
-    // 1. Generate the AI response (Replace with your actual AI API call)
+    // 1. Generate the AI response
     const aiResponseText = `Mock AI Customer: I am frustrated with my recent bill!`; 
 
     // 2. Save the AI's response directly to Supabase
@@ -21,7 +26,7 @@ app.post('/generate-reply', async (req, res) => {
       .from('messages')
       .insert([
         {
-          session_id: sessionId,
+          session_id: activeSessionId,
           role: 'assistant',
           content: aiResponseText
         }
@@ -29,7 +34,7 @@ app.post('/generate-reply', async (req, res) => {
 
     if (error) throw error;
 
-    // 3. Return success (Vercel updates the UI via WebSockets, not this HTTP response)
+    // 3. Return success
     res.status(200).json({ success: true });
   } catch (error) {
     console.error(error);
