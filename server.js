@@ -21,6 +21,8 @@ app.post('/generate-reply', async (req, res) => {
     // 1. Generate the AI response
     const aiResponseText = `Mock AI Customer: I am frustrated with my recent bill!`; 
 
+// ... inside your app.post try block ...
+    
     // 2. Save the AI's response directly to Supabase
     const { error } = await supabase
       .from('messages')
@@ -34,8 +36,10 @@ app.post('/generate-reply', async (req, res) => {
 
     if (error) throw error;
 
-    // 3. Return success
-    res.status(200).json({ success: true });
+    // 3. Return the generated text back to Vercel!
+    // REPLACE your old res.status(200).json({ success: true }) with this line:
+    res.status(200).json({ content: aiResponseText });
+    
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to generate AI response' });
