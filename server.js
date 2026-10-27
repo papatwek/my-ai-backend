@@ -11,67 +11,70 @@ const supabase = createClient(
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-const SYSTEM_INSTRUCTION = `You are a non-tech-savvy customer contacting support.
-You have ZERO technical knowledge.
-BEFORE every response, identify the agent's last message type:
-- Question → answer it directly only
-- Instruction → attempt it, report what you see or experience
-- Statement → acknowledge naturally and wait
-STRICT RULES:
-- React only to the agent's most recent message
-- Never repeat a message you already sent
-- Never ask what to do next unless agent just gave a step
-- Never skip ahead or assume
-- Let the agent lead at all times
-- 1-2 sentences max per response
-- Stay in role until issue is resolved or both parties agree to close`;
-
 app.post('/generate-reply', async (req, res) => {
   const activeSessionId = req.body.sessionId || req.body.session_id;
+  const { messages, schema } = req.body;
 
   if (!activeSessionId) {
-    console.error("Missing session ID! Received payload:", req.body);
+    console.error("Missing session ID!");
     return res.status(400).json({ error: 'Missing session ID in request' });
   }
 
   try {
-    // 1. Fetch full conversation history from Supabase
-    const { data: messages, error: fetchError } = await supabase
-      .from('messages')
-      .select('role, content')
-      .eq('session_id', activeSessionId)
-      .order('created_at', { ascending: true });
+    // 1. Separate system instructions from user/assistant chat history
+    const systemInstructionText = (messages || [])
+      .filter(m => m.role === 'system')
+      .map(m => m.content || m.text)
+      .join('\n\n');
 
-    if (fetchError) throw fetchError;
+    const contents = (messages || [])
+      .filter(m => m.role !== 'system')
+      .map(m => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content || m.text || '' }]
+      }));
 
-    // 2. Build conversation history for Gemini
-    // Gemini uses 'user' and 'model' roles only
-    const contents = messages.map(msg => ({
-      role: msg.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: msg.content }]
-    }));
+    if (contents.length === 0) {
+      contents.push({ role: 'user', parts: [{ text: 'Please begin the scenario.' }] });
+    }
 
-    // 3. Call Gemini 2.0 Flash API
+    // 2. Prepare Gemini configuration (Applying the JSON schema if the frontend requested it)
+    const generationConfig = {
+      temperature: 0.7,
+    };
+
+    if (schema) {
+      generationConfig.responseMimeType = 'application/json';
+      generationConfig.responseSchema = schema;
+    }
+
+    const requestBody = {
+      contents: contents,
+      generationConfig: generationConfig
+    };
+
+    if (systemInstructionText) {
+      requestBody.system_instruction = {
+        parts: [{ text: systemInstructionText }]
+      };
+    }
+
+    // 3. Call the Gemini 2.0 Flash API directly
     const geminiResponse = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          system_instruction: {
-            parts: [{ text: SYSTEM_INSTRUCTION }]
-          },
-          contents: contents,
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 800,
-            topP: 0.9
-          }
-        })
+        body: JSON.stringify(requestBody)
       }
     );
 
     const geminiData = await geminiResponse.json();
+
+    if (!geminiResponse.ok) {
+       console.error("Gemini API Error:", JSON.stringify(geminiData));
+       return res.status(500).json({ error: 'Failed at Gemini API' });
+    }
 
     // 4. Extract the text response
     const aiResponseText = geminiData?.candidates?.[0]?.content?.parts?.[0]?.text;
@@ -81,7 +84,7 @@ app.post('/generate-reply', async (req, res) => {
       return res.status(500).json({ error: 'No response from Gemini' });
     }
 
-    // 5. Save AI response to Supabase
+    // 5. Save the AI's response to Supabase
     const { error: insertError } = await supabase
       .from('messages')
       .insert([{
@@ -90,9 +93,11 @@ app.post('/generate-reply', async (req, res) => {
         content: aiResponseText
       }]);
 
-    if (insertError) throw insertError;
+    if (insertError) {
+        console.error("Supabase Save Error:", insertError);
+    }
 
-    // 6. Return response to frontend
+    // 6. Return the perfectly formatted text to Vercel/Frontend
     res.status(200).json({ content: aiResponseText });
 
   } catch (error) {
