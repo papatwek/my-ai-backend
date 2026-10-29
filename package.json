@@ -1,9 +1,15 @@
 {
-  "name": "my-ai-backend",
+  "name": "wyze-ai-render-backend",
   "version": "1.0.0",
+  "description": "Dedicated AI Orchestration Backend for Wyze ECE Ticket Simulator on Render",
   "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
   "dependencies": {
-    "@supabase/supabase-js": "^2.39.0",
-    "express": "^4.18.2"
+    "@google/genai": "^2.4.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2"
   }
 }
