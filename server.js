@@ -1,10 +1,11 @@
-
 /**
  * Render Dedicated Backend Server for Wyze ECE Simulator
  *
- * Gemini = Primary AI
- * OpenAI = Optional backup (only when explicitly confirmed free)
- * Rule-based responses = Final fallback
+ * FREE-TIER-ONLY AI ROUTING
+ * 1. Gemini = Primary AI (use only within its free quota)
+ * 2. OpenRouter / Google Gemma :free = Backup AI
+ * 3. Local contextual engine = Final fallback (no inference API cost)
+ * No Hugging Face or OpenAI integration. No paid model fallback.
  */
 
 const express = require('express');
@@ -307,8 +308,8 @@ Account: ${email}`;
   return reply;
 }
 
-// Convert conversation history into OpenAI message format
-function buildOpenAIMessages(
+// Convert conversation history into OpenRouter chat-completions format
+function buildOpenRouterMessages(
   contents,
   messages,
   persona,
@@ -386,12 +387,10 @@ function buildOpenAIMessages(
   return result;
 }
 
-// OpenAI backup
-// IMPORTANT:
-// No default model is configured.
-// No automatic paid-model selection is allowed.
-// This function only runs when explicitly enabled.
-async function generateWithOpenAI({
+// OpenRouter backup (Google Gemma free model)
+ // The model must explicitly use the :free variant. This prevents accidental
+ // selection of a paid OpenRouter model through an environment-variable typo.
+async function generateWithOpenRouter({
   contents,
   messages,
   persona,
@@ -399,84 +398,68 @@ async function generateWithOpenAI({
   prod,
   noun
 }) {
-  const model = process.env.OPENAI_FREE_MODEL;
-  const apiKey = process.env.OPENAI_API_KEY;
+  const model = process.env.OPENROUTER_MODEL;
+  const apiKey = process.env.OPENROUTER_API_KEY;
 
-  const freeConfirmed =
-    process.env.OPENAI_FREE_TIER_CONFIRMED === 'true';
-
-  if (!freeConfirmed || !model || !apiKey) {
-    throw new Error(
-      'OpenAI backup disabled. A verified free API model, API key, and explicit confirmation are required.'
-    );
+  if (!apiKey || !model) {
+    throw new Error('OpenRouter backup is not configured.');
   }
 
-  if (typeof fetch !== 'function') {
-    throw new Error('Native fetch requires Node.js 18 or newer.');
+  if (!model.endsWith(':free')) {
+    throw new Error('OpenRouter backup refused: OPENROUTER_MODEL must end with :free.');
   }
 
   const controller = new AbortController();
-
-  const timeoutMs = Math.max(
-    5000,
-    Number(process.env.OPENAI_TIMEOUT_MS) || 20000
-  );
-
-  const timer = setTimeout(
-    () => controller.abort(),
-    timeoutMs
-  );
+  const timeoutMs = Math.max(5000, Number(process.env.OPENROUTER_TIMEOUT_MS) || 20000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        method: 'POST',
-
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
-        },
-
-        body: JSON.stringify({
-          model,
-
-          messages: buildOpenAIMessages(
-            contents,
-            messages,
-            persona,
-            systemInstruction,
-            prod,
-            noun
-          ),
-
-          temperature: 0.3,
-          max_tokens: 800
-        }),
-
-        signal: controller.signal
-      }
-    );
+    const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+        ...(process.env.OPENROUTER_SITE_URL
+          ? { 'HTTP-Referer': process.env.OPENROUTER_SITE_URL }
+          : {}),
+        'X-Title': 'Wyze ECE Training Simulator'
+      },
+      body: JSON.stringify({
+        model,
+        messages: buildOpenRouterMessages(
+          contents,
+          messages,
+          persona,
+          systemInstruction,
+          prod,
+          noun
+        ),
+        temperature: 0.3,
+        max_tokens: 800
+      }),
+      signal: controller.signal
+    });
 
     const data = await response.json().catch(() => ({}));
 
     if (!response.ok) {
       const error = new Error(
-        data?.error?.message || `HTTP ${response.status}`
+        data?.error?.message || `OpenRouter request failed with HTTP ${response.status}`
       );
-
       error.status = response.status;
       throw error;
     }
 
     const output = data?.choices?.[0]?.message?.content;
+    const text = Array.isArray(output)
+      ? output.map(part => typeof part === 'string' ? part : part?.text || '').join('')
+      : output;
 
-    if (typeof output !== 'string' || !output.trim()) {
-      throw new Error('OpenAI returned an empty response.');
+    if (typeof text !== 'string' || !text.trim()) {
+      throw new Error('OpenRouter returned an empty response.');
     }
 
-    return output.trim();
-
+    return text.trim();
   } finally {
     clearTimeout(timer);
   }
@@ -506,6 +489,7 @@ async function handleChat(req, res) {
   );
 
   let replyText = null;
+  let providerUsed = 'contextual_engine';
 
   // ==========================================
   // 1. PRIMARY AI: GEMINI
@@ -676,6 +660,7 @@ async function handleChat(req, res) {
               !/\bcamera\b/i.test(candidate)
             ) {
               replyText = candidate;
+              providerUsed = 'gemini';
 
               console.log(
                 `[RENDER AI SUCCESS] Gemini ${modelName} generated a response.`
@@ -702,24 +687,13 @@ async function handleChat(req, res) {
   }
 
   // ==========================================
-  // 2. SECONDARY AI: OPENAI BACKUP
+  // 2. SECONDARY AI: OPENROUTER / GOOGLE GEMMA FREE BACKUP
   // ==========================================
-  // Runs only when:
-  // - Gemini did not produce a usable response
-  // - OPENAI_FREE_TIER_CONFIRMED is exactly "true"
-  // - OPENAI_FREE_MODEL is explicitly configured
-  // - OPENAI_API_KEY is configured
-  //
-  // No default model is selected.
-
-  if (
-    !replyText &&
-    process.env.OPENAI_FREE_TIER_CONFIRMED === 'true' &&
-    process.env.OPENAI_FREE_MODEL &&
-    process.env.OPENAI_API_KEY
-  ) {
+  // Called only when Gemini did not produce a usable response.
+  // The helper rejects any model ID that does not end in ":free".
+  if (!replyText && process.env.OPENROUTER_API_KEY && process.env.OPENROUTER_MODEL) {
     try {
-      replyText = await generateWithOpenAI({
+      replyText = await generateWithOpenRouter({
         contents,
         messages,
         persona,
@@ -728,26 +702,22 @@ async function handleChat(req, res) {
         noun
       });
 
-      // Prevent a non-camera device from being described as a camera
-      if (
-        !isCamera &&
-        /\bcamera\b/i.test(replyText)
-      ) {
+      // Preserve the device-specific rule for non-camera products.
+      if (!isCamera && /\bcamera\b/i.test(replyText)) {
         replyText = null;
       }
 
       if (replyText) {
+        providerUsed = 'openrouter-gemma';
         console.log(
-          `[RENDER AI SUCCESS] OpenAI backup model ${process.env.OPENAI_FREE_MODEL} responded.`
+          `[RENDER AI SUCCESS] OpenRouter backup model ${process.env.OPENROUTER_MODEL} responded.`
         );
       }
-
-    } catch (openAIErr) {
+    } catch (openRouterErr) {
       console.warn(
-        '[RENDER AI BACKUP] OpenAI unavailable; using local fallback:',
-        openAIErr.message
+        '[RENDER AI BACKUP] OpenRouter/Gemma unavailable; using local fallback:',
+        openRouterErr.message
       );
-
       replyText = null;
     }
   }
@@ -757,6 +727,7 @@ async function handleChat(req, res) {
   // ==========================================
 
   if (!replyText) {
+    providerUsed = 'contextual_engine';
     console.log(
       '[RENDER AI FALLBACK] Generating contextual persona response.'
     );
@@ -832,6 +803,7 @@ async function handleChat(req, res) {
     text: replyText,
     status: 'OPEN',
     source: 'render-backend',
+    provider: providerUsed,
     turnNumber: turnNumber || 1
   });
 }
